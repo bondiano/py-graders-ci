@@ -1,0 +1,120 @@
+# Reusable grader workflow for BatSchool G-projects. A mentee repository calls
+# it at a published tag (see README); the platform accepts the report only from
+# this file at an allowed tag (OIDC claim job_workflow_ref).
+name: grade
+
+on:
+  workflow_call:
+    inputs:
+      craft:
+        description: Craft id, e.g. ormka
+        required: true
+        type: string
+      stage:
+        description: Stage number, e.g. 12
+        required: true
+        type: string
+      services:
+        description: 'Service profile: none, postgres, redis or postgres,redis'
+        required: false
+        type: string
+        default: none
+      platform-url:
+        description: Report endpoint
+        required: false
+        type: string
+        default: https://school.bondiano.com/api/code/ci-report
+      audience:
+        description: OIDC audience the platform expects
+        required: false
+        type: string
+        default: https://school.bondiano.com
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  grade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # An empty image skips the service, so one job covers every profile.
+    services:
+      postgres:
+        image: ${{ contains(inputs.services, 'postgres') && 'postgres:17-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s
+          --health-timeout 2s --health-retries 30
+      redis:
+        image: ${{ contains(inputs.services, 'redis') && 'redis:7-alpine' || '' }}
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 30
+    env:
+      CRAFT: ${{ inputs.craft }}
+      STAGE: ${{ inputs.stage }}
+      SERVICES: ${{ inputs.services }}
+    steps:
+      - name: Check inputs
+        run: |
+          printf '%s' "$CRAFT" | grep -Eqx '[a-z0-9-]{1,40}' || { echo "bad craft: $CRAFT"; exit 1; }
+          printf '%s' "$STAGE" | grep -Eqx '[0-9]{1,3}' || { echo "bad stage: $STAGE"; exit 1; }
+          echo "IMAGE=ghcr.io/bondiano/py-grader-$CRAFT:$STAGE" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+
+      - name: Pull grader
+        run: |
+          docker pull "$IMAGE"
+          task="$(docker inspect -f '{{ index .Config.Labels "com.bondiano.school.task" }}' "$IMAGE")"
+          [ -n "$task" ] || { echo "grader image has no task label"; exit 1; }
+          echo "TASK=$task" >> "$GITHUB_ENV"
+
+      - name: Run grader
+        run: |
+          work="$RUNNER_TEMP/work"
+          cp -R src "$work" && rm -rf "$work/.git" && chmod -R a+rwX "$work"
+          network=none
+          [ "$SERVICES" = none ] || network=host
+          set +e
+          docker run --rm --network "$network" --read-only --tmpfs /tmp \
+            --cpus 2 --memory 2g --pids-limit 512 \
+            -e DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
+            -e REDIS_URL=redis://localhost:6379/0 \
+            -v "$work:/work" "$IMAGE" > "$RUNNER_TEMP/grader.jsonl"
+          echo "pytest exit code: $?"
+          set -e
+          jq -R -s 'split("\n") | map(fromjson? | select(type == "object" and .event == "test") | del(.event))' \
+            "$RUNNER_TEMP/grader.jsonl" > "$RUNNER_TEMP/tests.json"
+          jq -r '.[] | (if .passed then "PASS " else "FAIL " end) + .name + (if .message then "\n     " + .message else "" end)' \
+            "$RUNNER_TEMP/tests.json"
+
+      - name: Report to the platform
+        env:
+          PLATFORM_URL: ${{ inputs.platform-url }}
+          AUDIENCE: ${{ inputs.audience }}
+          SHA: ${{ github.sha }}
+        run: |
+          token="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)"
+          echo "::add-mask::$token"
+          jq -n --arg task "$TASK" --arg sha "$SHA" --slurpfile tests "$RUNNER_TEMP/tests.json" \
+            '{task: $task, sha: $sha, tests: $tests[0]}' > "$RUNNER_TEMP/report.json"
+          curl -fsS -X POST "$PLATFORM_URL" \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            --data-binary "@$RUNNER_TEMP/report.json"
+          echo
+
+      - name: Verdict
+        run: |
+          total="$(jq length "$RUNNER_TEMP/tests.json")"
+          passed="$(jq 'map(select(.passed)) | length' "$RUNNER_TEMP/tests.json")"
+          echo "### $TASK: $passed / $total" >> "$GITHUB_STEP_SUMMARY"
+          [ "$total" -gt 0 ] && [ "$passed" = "$total" ]
