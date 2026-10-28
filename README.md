@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   grade:
-    uses: bondiano/py-graders-ci/.github/workflows/grade.yml@v1
+    uses: bondiano/py-graders-ci/.github/workflows/grade.yml@v2
     with:
       craft: ormka
       stage: '12'
@@ -43,8 +43,15 @@ jobs:
 | `craft` | required | craft id, e.g. `ormka` |
 | `stage` | required | stage number |
 | `services` | `none` | service containers: `postgres` (`localhost:5432`, user and password `postgres`), `redis` (`localhost:6379`); the grader gets `DATABASE_URL` and `REDIS_URL` |
+| `container` | `false` | build the repository `Dockerfile` (`--build-arg GIT_SHA=<commit>`), run `manage.py release`, start the image on `localhost:8000` next to the services, record its facts (user, size, health, clean stop, logs) into a read-only `/facts` for the grader, and leave a fresh copy running for live probes; needs `services` and `@v2` |
 | `platform-url` | `https://school.bondiano.com/api/code/ci-report` | report endpoint |
 | `audience` | `https://school.bondiano.com` | OIDC audience |
+
+## Versions
+
+`@v1` runs the grader only. `@v2` adds the `container` input; without it a
+`@v2` run behaves like `@v1`. Tags are never moved: the school trusts the tag
+named in the OIDC `job_workflow_ref`, so a new behaviour gets a new tag.
 
 ## What runs
 

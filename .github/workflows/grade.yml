@@ -29,6 +29,11 @@ on:
         required: false
         type: string
         default: https://school.bondiano.com
+      container:
+        description: Build the repository Dockerfile, run it next to the services and let the grader probe it
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -37,7 +42,7 @@ permissions:
 jobs:
   grade:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     # An empty image skips the service, so one job covers every profile.
     services:
       postgres:
@@ -58,6 +63,8 @@ jobs:
       CRAFT: ${{ inputs.craft }}
       STAGE: ${{ inputs.stage }}
       SERVICES: ${{ inputs.services }}
+      CONTAINER: ${{ inputs.container }}
+      SHA: ${{ github.sha }}
     steps:
       - name: Check inputs
         run: |
@@ -77,17 +84,97 @@ jobs:
           [ -n "$task" ] || { echo "grader image has no task label"; exit 1; }
           echo "TASK=$task" >> "$GITHUB_ENV"
 
+      # Container mode: this workflow, not the repository, records the facts the grader
+      # checks (user, size, health, stop), so a checkout cannot forge them.
+      - name: Build the image
+        if: inputs.container
+        run: docker build --build-arg "GIT_SHA=$SHA" -t grade-app:ci src
+
+      - name: Run the image and record facts
+        if: inputs.container
+        run: |
+          [ "$SERVICES" != none ] || { echo "container mode needs services"; exit 1; }
+          facts="$RUNNER_TEMP/facts"
+          mkdir -p "$facts"
+          token() { head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 64; }
+          secret_key="$(token)"; media_key="$(token)"; metrics_token="$(token)"
+          for value in "$secret_key" "$media_key" "$metrics_token"; do echo "::add-mask::$value"; done
+          echo "METRICS_TOKEN=$metrics_token" >> "$GITHUB_ENV"
+          {
+            echo "DJANGO_SECRET_KEY=$secret_key"
+            echo "MEDIA_SIGNING_KEY=$media_key"
+            echo "METRICS_TOKEN=$metrics_token"
+            echo "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres"
+            echo "REDIS_URL=redis://localhost:6379/0"
+            echo "CACHE_URL=locmem://"
+            echo "DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1"
+            echo "DJANGO_TRUSTED_PROXIES=127.0.0.1"
+            echo "DJANGO_SECURE=1"
+            echo "SITE_URL=https://localhost"
+          } > "$RUNNER_TEMP/app.env"
+
+          set +e
+          docker run --rm --network host --env-file "$RUNNER_TEMP/app.env" grade-app:ci python manage.py release
+          release=$?
+          set -e
+
+          healthy() {
+            started=$(date +%s)
+            while [ $(( $(date +%s) - started )) -lt 90 ]; do
+              status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$1")"
+              case "$status" in
+                healthy) echo $(( $(date +%s) - started )); return 0 ;;
+                none) return 1 ;;
+              esac
+              [ "$(docker inspect -f '{{.State.Running}}' "$1")" = true ] || return 1
+              sleep 1
+            done
+            return 1
+          }
+
+          docker run -d --name grade-app-1 --network host --env-file "$RUNNER_TEMP/app.env" grade-app:ci
+          seconds="$(healthy grade-app-1 || echo null)"
+          for path in / /livez /readyz /version /no-such-page; do
+            curl -s -o /dev/null -H 'X-Forwarded-Proto: https' "http://127.0.0.1:8000$path" || true
+          done
+          docker logs grade-app-1 > "$facts/logs.txt" 2>&1
+          stop_started=$(date +%s.%N)
+          docker stop -t 30 grade-app-1 > /dev/null
+          stop_seconds="$(awk -v a="$stop_started" -v b="$(date +%s.%N)" 'BEGIN { printf "%.2f", b - a }')"
+          exit_code="$(docker inspect -f '{{.State.ExitCode}}' grade-app-1)"
+          docker rm grade-app-1 > /dev/null
+
+          # A fresh copy for the grader's live probes.
+          docker run -d --name grade-app --network host --env-file "$RUNNER_TEMP/app.env" grade-app:ci
+          healthy grade-app > /dev/null || echo "grade-app is not healthy"
+
+          jq -n \
+            --arg user "$(docker image inspect -f '{{.Config.User}}' grade-app:ci)" \
+            --argjson healthcheck "$(docker image inspect -f '{{if .Config.Healthcheck}}true{{else}}false{{end}}' grade-app:ci)" \
+            --argjson size "$(docker image inspect -f '{{.Size}}' grade-app:ci)" \
+            --argjson release "$release" --argjson healthy "$seconds" \
+            --argjson stop_seconds "$stop_seconds" --argjson exit_code "$exit_code" \
+            --arg secret_key "$secret_key" --arg media_key "$media_key" --arg metrics_token "$metrics_token" \
+            '{user: $user, healthcheck: $healthcheck, size_bytes: $size, release_exit_code: $release,
+              healthy_seconds: $healthy, stop: {seconds: $stop_seconds, exit_code: $exit_code},
+              secrets: [$secret_key, $media_key, $metrics_token]}' > "$facts/facts.json"
+          chmod -R a+rX "$facts"
+
       - name: Run grader
         run: |
           work="$RUNNER_TEMP/work"
           cp -R src "$work" && rm -rf "$work/.git" && chmod -R a+rwX "$work"
           network=none
           [ "$SERVICES" = none ] || network=host
+          set -- -e DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
+            -e REDIS_URL=redis://localhost:6379/0
+          if [ "$CONTAINER" = true ]; then
+            set -- "$@" -v "$RUNNER_TEMP/facts:/facts:ro" -e SHPIL_FACTS=/facts \
+              -e APP_URL=http://127.0.0.1:8000 -e EXPECTED_SHA="$SHA" -e METRICS_TOKEN="$METRICS_TOKEN"
+          fi
           set +e
           docker run --rm --network "$network" --read-only --tmpfs /tmp \
-            --cpus 2 --memory 2g --pids-limit 512 \
-            -e DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
-            -e REDIS_URL=redis://localhost:6379/0 \
+            --cpus 2 --memory 2g --pids-limit 512 "$@" \
             -v "$work:/work" "$IMAGE" > "$RUNNER_TEMP/grader.jsonl"
           echo "pytest exit code: $?"
           set -e
@@ -100,7 +187,6 @@ jobs:
         env:
           PLATFORM_URL: ${{ inputs.platform-url }}
           AUDIENCE: ${{ inputs.audience }}
-          SHA: ${{ github.sha }}
         run: |
           token="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)"
