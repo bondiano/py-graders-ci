@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       services:
-        description: 'Service profile: none, postgres, redis or postgres,redis'
+        description: 'Service profile: none or a comma list of postgres, redis, rabbitmq, kafka'
         required: false
         type: string
         default: none
@@ -59,6 +59,23 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 2s
           --health-timeout 2s --health-retries 30
+      rabbitmq:
+        image: ${{ contains(inputs.services, 'rabbitmq') && 'rabbitmq:4-alpine' || '' }}
+        # guest may only log in over loopback, and the mapped port is not loopback inside.
+        env:
+          RABBITMQ_DEFAULT_USER: grader
+          RABBITMQ_DEFAULT_PASS: grader
+        ports: ['5672:5672']
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 3s
+          --health-timeout 5s --health-retries 40
+      # The image defaults to a single KRaft node advertised on localhost:9092.
+      kafka:
+        image: ${{ contains(inputs.services, 'kafka') && 'apache/kafka:4.3.2' || '' }}
+        ports: ['9092:9092']
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 3s --health-timeout 10s --health-retries 40
     env:
       CRAFT: ${{ inputs.craft }}
       STAGE: ${{ inputs.stage }}
@@ -167,7 +184,8 @@ jobs:
           network=none
           [ "$SERVICES" = none ] || network=host
           set -- -e DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
-            -e REDIS_URL=redis://localhost:6379/0
+            -e REDIS_URL=redis://localhost:6379/0 \
+            -e RABBIT_URL=amqp://grader:grader@localhost:5672/ -e KAFKA_BOOTSTRAP=localhost:9092
           if [ "$CONTAINER" = true ]; then
             set -- "$@" -v "$RUNNER_TEMP/facts:/facts:ro" -e SHPIL_FACTS=/facts \
               -e APP_URL=http://127.0.0.1:8000 -e EXPECTED_SHA="$SHA" -e METRICS_TOKEN="$METRICS_TOKEN"

@@ -30,7 +30,7 @@ jobs:
     with:
       craft: ormka
       stage: '12'
-      services: none   # none | postgres | redis | postgres,redis
+      services: none   # none or a comma list: postgres, redis, rabbitmq, kafka
 ```
 
 3. Push. The job log lists every test, the job summary shows the score, and a
@@ -42,7 +42,7 @@ jobs:
 |---|---|---|
 | `craft` | required | craft id, e.g. `ormka` |
 | `stage` | required | stage number |
-| `services` | `none` | service containers: `postgres` (`localhost:5432`, user and password `postgres`), `redis` (`localhost:6379`); the grader gets `DATABASE_URL` and `REDIS_URL` |
+| `services` | `none` | service containers: `postgres` (`localhost:5432`, user and password `postgres`), `redis` (`localhost:6379`), `rabbitmq` (`localhost:5672`, user and password `grader`), `kafka` (single KRaft node, `localhost:9092`); the grader gets `DATABASE_URL`, `REDIS_URL`, `RABBIT_URL` and `KAFKA_BOOTSTRAP`; `rabbitmq` and `kafka` need `@v3` |
 | `container` | `false` | build the repository `Dockerfile` (`--build-arg GIT_SHA=<commit>`), run `manage.py release`, start the image on `localhost:8000` next to the services, record its facts (user, size, health, clean stop, logs) into a read-only `/facts` for the grader, and leave a fresh copy running for live probes; needs `services` and `@v2` |
 | `platform-url` | `https://school.bondiano.com/api/code/ci-report` | report endpoint |
 | `audience` | `https://school.bondiano.com` | OIDC audience |
